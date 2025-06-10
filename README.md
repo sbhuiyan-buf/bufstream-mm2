@@ -25,10 +25,22 @@ docker-compose  up -d
 ```
 5. Consume all records from the destination topic "source.replicate_me"
 ```
-4-consume-from-bufstream.sh
+./4-consume-from-bufstream.sh
 ```
-
-
-TODO:
-1. Configure Checkpoint connector to mirror consumer group offsets from source to destination
+6. Start checkpoint connector to sync offsets from source to destination cluster (note the group refresh and sync interval is set to 20s here)
+```
+./5-submit-checkpoint-connector.sh
+```
+7. Test reading some messages with a test consumer group on the source cluster
+```
+docker exec connect sh -c "kafka-console-consumer --from-beginning --topic replicate_me --bootstrap-server broker:29092 --group test-group-6 --max-messages 1
+```
+8. Wait 20s and check that the consumer group is carried over to the destination cluster
+```
+./list-dest-consumer-groups.sh
+```
+9. Describe consumer group from step 7
+```
+docker exec connect sh -c "kafka-consumer-groups --describe --group test-group-6  --bootstrap-server bufstream:9093"
+```
 
