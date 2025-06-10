@@ -1,0 +1,256 @@
+# This docker-compose.yml file provides a development-appropriate
+# orchestration of containers that allow a query engine (Spark) to query
+# Bufstream (Kafka) topic data archived to object storage (MinIO) in
+# Iceberg-compatible format through a REST Iceberg catalog.
+#
+# For production-suitable deployments of Bufstream, refer to its documentation
+# at http://buf.build/docs/bufstream.
+services:
+  postgres:
+    image: postgres:14
+    container_name: postgres
+    environment: ["POSTGRES_USER=root", "POSTGRES_PASSWORD=password", "POSTGRES_DB=bufstream"]
+    networks:
+      iceberg_net:
+    volumes: 
+    - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-d", "bufstream"]
+      interval: 2s
+      retries: 30
+
+  # Object storage: MinIO and its controller (mc)
+  minio:
+    image: minio/minio:RELEASE.2025-05-24T17-08-30Z
+    container_name: minio
+    volumes:
+    - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    healthcheck:
+      test: [ "CMD", "curl", "--silent", "--fail", "--output", "/dev/null", "http://localhost:9000/minio/health/live" ]
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    command: ["server", "/data", "--console-address", ":9001"]
+  mc:
+    #depends_on:
+    #  minio:
+    #    condition: service_healthy
+    image: minio/mc:RELEASE.2025-05-21T01-59-54Z
+    container_name: mc
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      echo 'mc starting up stuff';
+      until (/usr/bin/mc alias set  minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc anonymous set public minio/warehouse;
+      #tail -f /dev/null
+      "
+
+  # A REST Iceberg catalog backed by MinIO
+#  rest:
+#    depends_on:
+#      minio:
+#        condition: service_healthy
+#    image: apache/iceberg-rest-fixture:1.9.1
+#    container_name: iceberg-rest
+#    networks:
+#      iceberg_net:
+#    ports:
+#      - 8181:8181
+#    healthcheck:
+#      test: [ "CMD", "curl", "--silent", "--fail", "--output", "/dev/null", "http://localhost:8181/v1/config" ]
+#      start_period: 15s
+#      interval: 5s
+#      timeout: 10s
+#      retries: 10
+#    environment:
+#      - AWS_ACCESS_KEY_ID=admin
+#      - AWS_SECRET_ACCESS_KEY=password
+#      - AWS_REGION=us-east-1
+#      - CATALOG_WAREHOUSE=s3://warehouse/
+#      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+#      - CATALOG_S3_ENDPOINT=http://minio:9000
+
+  # The Bufstream broker, relying on MinIO for object storage and the REST
+  # Iceberg catalog for archival. Additional configuration is in
+  # config/bufstream.yaml.
+  bufstream:
+    image: bufbuild/bufstream
+    hostname: localhost
+    container_name: bufstream
+    networks:
+      iceberg_net:
+    depends_on:
+      postgres: { "condition": "service_healthy" }
+      mc: { "condition": "service_completed_successfully" }
+
+      minio:
+        condition: service_healthy
+#      rest:
+#        condition: service_healthy
+    environment:
+      BUFSTREAM_KAFKA_HOST: bufstream
+      BUFSTREAM_KAFKA_PUBLIC_HOST: bufstream
+    ports:
+      # We'll expose bufstream on the host at port 9093.
+      - "9093:9093"
+      - "9089:9089"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/bufstream", "admin", "status", "--exit-code", "--url", "http://127.0.0.1:9089"]
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    # Edit bufstream.yaml within this repository to change configuration.
+    volumes:
+      - ./config/bufstream.yaml:/bufstream.yaml
+    command: [
+      "serve",
+      "--config", "/bufstream.yaml",
+    ]
+
+  # A GUI for Bufstream's Kafka broker. See https://akhq.io
+  #
+  # Browse to http://localhost:8282 on your machine.
+  akhq:
+    image: tchiotludo/akhq:0.25.0
+    container_name: akhq
+    stop_signal: SIGKILL
+    networks:
+      iceberg_net:
+    depends_on:
+      bufstream:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--fail", "--output", "/dev/null", "http://localhost:28081/health"]
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    ports:
+      - "8282:8080"
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+            bufstream-local:
+              properties:
+                bootstrap.servers: "bufstream:9093"
+                client.id: "akhq;broker_count=1;host_override=bufstream"
+              schema-registry:
+                url: "https://demo.buf.dev/integrations/confluent/bufstream-demo"
+                type: "confluent"
+
+  # Spark, relying on MinIO and the REST Iceberg catalog.
+#  spark-iceberg:
+#    image: tabulario/spark-iceberg:3.5.5_1.8.1
+#    container_name: spark-iceberg
+#    build: spark/
+#    networks:
+#      iceberg_net:
+#    depends_on:
+#      minio:
+#        condition: service_healthy
+#      rest:
+#        condition: service_healthy
+#    volumes:
+#      - ./notebooks:/home/iceberg/notebooks/notebooks
+#    environment:
+#      - AWS_ACCESS_KEY_ID=admin
+#      - AWS_SECRET_ACCESS_KEY=password
+#      - AWS_REGION=us-east-1
+#    ports:
+#      - 8888:8888
+#      - 8080:8080
+#      - 10000:10000
+#      - 10001:10001
+
+
+  broker:
+    image: confluentinc/cp-kafka:7.9.0
+    hostname: broker
+    container_name: broker
+    networks:
+      iceberg_net:
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://broker:29092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      # Replace CLUSTER_ID with a unique base64 UUID using "bin/kafka-storage.sh random-uuid"
+      # See https://docs.confluent.io/kafka/operations-tools/kafka-tools.html#kafka-storage-sh
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+
+
+
+  connect:
+    image: confluentinc/cp-kafka-connect
+    hostname: connect
+    container_name: connect
+    depends_on:
+      - broker
+    networks:
+      iceberg_net:
+    ports:
+      - "8083:8083"
+      - "28082:28082"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: 'broker:29092'
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_REST_PORT: '28082'
+      CONNECT_GROUP_ID: compose-connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: 10000
+      CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.converters.ByteArrayConverter
+      # CLASSPATH required due to CC-2422
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+      CONNECT_LOG4J_LOGGERS: org.apache.zookeeper=ERROR,org.I0Itec.zkclient=ERROR,org.reflections=ERROR
+
+
+
+networks:
+  iceberg_net:
+
+
+volumes:
+  minio_data:
+  postgres_data:
+  
